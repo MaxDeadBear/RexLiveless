@@ -60,6 +60,10 @@ struct Config {
   std::function<void()> on_quit;
   // The sign-in screen waits for this at startup, e.g. until a launcher closes.
   std::function<bool()> ready_for_sign_in;
+  // Optional: whether the sign-in screen opens by itself at startup when no
+  // account is remembered. Unset: it does. Either way the Guide button and the
+  // title's own sign-in prompt open it.
+  std::function<bool()> sign_in_at_startup;
   // What the Guide's icons, gamerpics and achievement icons are uploaded
   // through: the app's ReXApp::immediate_drawer().
   rex::ui::ImmediateDrawer* immediate_drawer = nullptr;
@@ -76,9 +80,17 @@ struct Config {
   // (uv: u0, v0, u1, v1); nullptr when there's none. Set, the Guide blurs the
   // live game behind it; unset, it just darkens it.
   std::function<rex::ui::ImmediateTexture*(float uv[4])> game_frame;
+  // Optional, preferred over game_frame: the same frame already blurred by a
+  // Gaussian of `sigma` window pixels, by the app's renderer. The Guide then
+  // draws it once; blurring game_frame itself takes it up to 121 full-window
+  // copies a frame, which slower GPUs feel. Also gets uv as game_frame does.
+  std::function<rex::ui::ImmediateTexture*(float sigma, float uv[4])> blurred_game_frame;
   // System Settings > Config saves the game's settings (cvars) here, as the
   // F4 settings overlay does; unset, changes there last until the game closes.
   std::filesystem::path config_file;
+  // Optional: saves the settings instead, for an app with a config writer of its own. The SDK's
+  // rex::cvar::SaveConfig writes strings unescaped, so a Windows path in any setting breaks the file.
+  std::function<void()> save_settings;
   // Optional: whether Config lists a setting, by cvar name (e.g. to leave out
   // ones the app hides). Unset: all of them but console commands.
   std::function<bool(std::string_view name)> show_setting;
@@ -195,13 +207,29 @@ bool MenuShown(std::string_view id);
 
 // What a menu's build function puts on it, top to bottom. Labels are what the
 // rows say; anything after "##" in one isn't shown, and only tells rows with
-// the same words apart (as in ImGui).
+// the same words apart. After "###", that part alone tells the row apart, so
+// its words can change and it stays the same row (as in ImGui).
 class Menu {
  public:
   enum class Tone { kNormal, kDim, kError };
 
+  // How a Button or Page row looks past its label.
+  struct Look {
+    std::string detail;  // small caps on the right
+    std::string sub;     // a second line under the label; makes the row tall
+    // A picture on the left, asked for only while the row is on screen, so a
+    // long list of downloaded icons fetches only what's seen. Null while
+    // there's none yet; setting *loading shows a spinner in its place.
+    std::function<rex::ui::ImmediateTexture*(bool* loading)> icon;
+    bool icon_dim = false;
+    // Greyed, and choosing it does nothing. The row keeps its place, so rows
+    // below it don't move under the player's selection.
+    bool disabled = false;
+  };
+
   // A row that does something: true the frame it's chosen.
   bool Button(std::string_view label, std::string_view detail = {});
+  bool Button(std::string_view label, const Look& look);
   // On or off, shown as a switch. True when it changed.
   bool Toggle(std::string_view label, bool* value);
   // One of `options`: left and right step through them, choosing it lists them
@@ -218,12 +246,60 @@ class Menu {
   // A row that opens a page of its own: `build` says what's on it, and is
   // called only while it's shown.
   void Page(std::string_view label, const std::function<void(Menu&)>& build, std::string_view detail = {});
+  void Page(std::string_view label, const std::function<void(Menu&)>& build, const Look& look);
+
+  // Buttons side by side in one row: left and right pick one. A button with a
+  // page opens it; the one chosen without one, or -1.
+  struct BarButton {
+    std::string label;
+    std::function<void(Menu&)> page;
+  };
+  int Bar(std::string_view label, const std::vector<BarButton>& buttons);
+
+  // One thing in a Lists row.
+  struct Item {
+    std::string id;  // what tells it apart, and what an action names
+    std::string label;
+    std::string sub;  // a second line
+    std::function<rex::ui::ImmediateTexture*(bool* loading)> icon;  // as Look::icon
+    // What choosing it opens, titled with its label; without one, choosing it
+    // is a kOpen action.
+    std::function<void(Menu&)> page;
+  };
+  struct ListsDef {
+    std::string left_title, right_title;
+    std::vector<Item> left, right;  // the right in its order; the left as the app sorts it
+    // What sending a thing across does, for the button legend: from the left
+    // (such as "Enable") and from the right ("Disable").
+    std::string to_right = "Move Across", to_left = "Move Across";
+  };
+  struct ListsAction {
+    enum class Kind { kNone, kOpen, kMove };
+    Kind kind = Kind::kNone;
+    std::string id;
+    int list = 0;   // kMove: where it goes, 0 the left list and 1 the right
+    int index = 0;  // kMove: its place there
+  };
+  // Two lists side by side, as on a game's pack screen: things go from one to
+  // the other, and the right one's order can be changed. It fills the page
+  // below the rows before it, each list scrolling on its own. Up and down move
+  // in a list, left and right between them; A opens a thing (its page, or a
+  // kOpen action), X sends it across, and Y picks it up, to be carried up,
+  // down or across until it's put down. The mouse gets arrows on the thing
+  // under it. What the player did, for the app to do to its own lists; the row
+  // already shows it done.
+  ListsAction Lists(std::string_view label, const ListsDef& lists);
+
   // Rows that aren't picked: a heading, wrapped text, and a picture as wide as
   // the menu (a texture of Config::immediate_drawer's; null shows its place),
   // width over height, no taller than max_height (pixels at 1080p).
   void Header(std::string_view text);
   void Text(std::string_view text, Tone tone = Tone::kNormal);
   void Image(rex::ui::ImmediateTexture* texture, float aspect, float max_height = 360.0f);
+  // How far something has got: the label and detail over a bar, `fraction`
+  // (0..1) of it filled. Below 0, it's under way but how far isn't known, and
+  // a stripe sweeps along the bar.
+  void Progress(std::string_view label, float fraction, std::string_view detail = {});
   // Goes back a page once it's built; at the first, closes the window (or the
   // Guide).
   void Back();
